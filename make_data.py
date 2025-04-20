@@ -10,6 +10,7 @@ from shapely.geometry import LineString, mapping
 from PIL import Image
 import json
 from tqdm import tqdm
+import cv2  # added for blur + noise
 
 # -----------------------
 # Configuration
@@ -22,7 +23,7 @@ CONFIGS = {
         "image_size": (256, 256),
         "n_samples": 100,
         "network_type": "drive",  
-        'data_dir': './data'  # Save directly to ./data/input and ./data/target
+        'data_dir': './data'  # Save to ./data/input, ./data/target, ./data/geojson
     },
 }
 
@@ -125,8 +126,10 @@ def rasterize_roads(roads, bounds, size, thickness_fn):
 def generate_samples(gdf_edges, gdf_nodes, n_samples=500, out_dir="data", image_size=(256, 256)):
     input_dir = os.path.join(out_dir, "input")
     target_dir = os.path.join(out_dir, "target")
+    geojson_dir = os.path.join(out_dir, "geojson")
     os.makedirs(input_dir, exist_ok=True)
     os.makedirs(target_dir, exist_ok=True)
+    os.makedirs(geojson_dir, exist_ok=True)
 
     selected_nodes = pick_random_intersections(gdf_nodes, n=n_samples)
 
@@ -136,13 +139,37 @@ def generate_samples(gdf_edges, gdf_nodes, n_samples=500, out_dir="data", image_
         bounds = (pt.x - buffer_m, pt.y - buffer_m, pt.x + buffer_m, pt.y + buffer_m)
         clip = gdf_edges.cx[bounds[0]:bounds[2], bounds[1]:bounds[3]].copy()
         if clip.empty:
+            print(f"[{i}] Skipped empty patch.")
             continue
 
+        # Rasterize and distort input
         image_array = rasterize_roads(clip, bounds, image_size, get_default_thickness)
+        image_array = cv2.GaussianBlur(image_array, (3, 3), 0)
+        noise = np.random.normal(0, 10, image_array.shape).astype(np.int16)
+        image_array = np.clip(image_array.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+
+        # Ground truth skeleton
         target_array = rasterize_roads(clip, bounds, image_size, lambda row: 0.0)
 
-        Image.fromarray(image_array).save(os.path.join(input_dir, f"image_{i:05d}.png"))
-        Image.fromarray(target_array).save(os.path.join(target_dir, f"image_{i:05d}.png"))
+        # Save input and target
+        input_path = os.path.join(input_dir, f"image_{i:05d}.png")
+        target_path = os.path.join(target_dir, f"image_{i:05d}.png")
+        Image.fromarray(image_array).save(input_path)
+        Image.fromarray(target_array).save(target_path)
+        print(f"[{i}] Saved input and target images.")
+
+        # Save geojson
+        geojson_path = os.path.join(geojson_dir, f"target_{i:05d}.geojson")
+        features = [{
+            "type": "Feature",
+            "geometry": mapping(geom),
+            "properties": {"highway": row.get("highway", "unknown")}
+        } for _, row in clip.iterrows() if isinstance((geom := row.geometry), LineString)]
+
+        geojson = {"type": "FeatureCollection", "features": features}
+        with open(geojson_path, 'w') as f:
+            json.dump(geojson, f)
+        print(f"[{i}] Saved geojson.")
 
 # -----------------------
 # Run the pipeline
@@ -154,6 +181,3 @@ if __name__ == "__main__":
                      n_samples=config['n_samples'],
                      out_dir=config['data_dir'],
                      image_size=config['image_size'])
-
-
-

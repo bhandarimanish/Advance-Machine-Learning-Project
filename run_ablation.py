@@ -1,21 +1,21 @@
 import os
+import random
 import torch
 import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader, random_split
+import cv2
 import numpy as np
 import matplotlib.pyplot as plt
-import cv2
-from torch.utils.data import Dataset, DataLoader
-from glob import glob
-from tqdm import tqdm
-import json
+from skimage.morphology import skeletonize
+from scipy.spatial import cKDTree
 
-# -----------------------
-# Dataset
-# -----------------------
+# ---------------------
+# Dataset Loader
+# ---------------------
 class RoadDataset(Dataset):
     def __init__(self, input_dir, target_dir):
-        self.input_paths = sorted(glob(os.path.join(input_dir, "*.png")))
-        self.target_paths = sorted(glob(os.path.join(target_dir, "*.png")))
+        self.input_paths = sorted([os.path.join(input_dir, f) for f in os.listdir(input_dir)])
+        self.target_paths = sorted([os.path.join(target_dir, f) for f in os.listdir(target_dir)])
 
     def __len__(self):
         return len(self.input_paths)
@@ -27,31 +27,63 @@ class RoadDataset(Dataset):
         y = torch.tensor(y, dtype=torch.float32).unsqueeze(0)
         return x, y
 
-# -----------------------
+# ---------------------
 # U-Net
-# -----------------------
+# ---------------------
 class UNet(nn.Module):
     def __init__(self):
         super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Conv2d(1, 8, 3, padding=1), nn.ReLU(),
-            nn.Conv2d(8, 8, 3, padding=1), nn.ReLU(),
-            nn.MaxPool2d(2)
-        )
-        self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(8, 8, 2, stride=2), nn.ReLU(),
-            nn.Conv2d(8, 1, 1)
-        )
+        def block(in_channels, out_channels):
+            return nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, 3, padding=1), nn.ReLU(),
+                nn.Conv2d(out_channels, out_channels, 3, padding=1), nn.ReLU()
+            )
+
+        self.enc1 = block(1, 16)
+        self.pool1 = nn.MaxPool2d(2)
+        self.enc2 = block(16, 32)
+        self.pool2 = nn.MaxPool2d(2)
+        self.enc3 = block(32, 64)
+        self.pool3 = nn.MaxPool2d(2)
+
+        self.bottleneck = block(64, 128)
+
+        self.upconv3 = nn.ConvTranspose2d(128, 64, 2, stride=2)
+        self.dec3 = block(128, 64)
+        self.upconv2 = nn.ConvTranspose2d(64, 32, 2, stride=2)
+        self.dec2 = block(64, 32)
+        self.upconv1 = nn.ConvTranspose2d(32, 16, 2, stride=2)
+        self.dec1 = block(32, 16)
+
+        self.final_conv = nn.Conv2d(16, 1, 1)
+
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        x = self.encoder(x)
-        x = self.decoder(x)
-        return self.sigmoid(x)
+        enc1 = self.enc1(x)
+        enc2 = self.enc2(self.pool1(enc1))
+        enc3 = self.enc3(self.pool2(enc2))
 
-# -----------------------
-# Losses
-# -----------------------
+        bottleneck = self.bottleneck(self.pool3(enc3))
+
+        dec3 = self.upconv3(bottleneck)
+        dec3 = torch.cat((dec3, enc3), dim=1)
+        dec3 = self.dec3(dec3)
+
+        dec2 = self.upconv2(dec3)
+        dec2 = torch.cat((dec2, enc2), dim=1)
+        dec2 = self.dec2(dec2)
+
+        dec1 = self.upconv1(dec2)
+        dec1 = torch.cat((dec1, enc1), dim=1)
+        dec1 = self.dec1(dec1)
+
+        out = self.final_conv(dec1)
+        return self.sigmoid(out)
+
+# ---------------------
+# Loss Functions
+# ---------------------
 class DiceLoss(nn.Module):
     def forward(self, inputs, targets, smooth=1):
         inputs = inputs.view(-1)
@@ -59,91 +91,233 @@ class DiceLoss(nn.Module):
         intersection = (inputs * targets).sum()
         return 1 - ((2. * intersection + smooth) / (inputs.sum() + targets.sum() + smooth))
 
-def mse(pred, target):
-    return ((pred - target) ** 2).mean()
+def compute_accuracy(preds, targets, threshold=0.5):
+    preds_bin = (preds > threshold).float()
+    correct = (preds_bin == targets).float().sum()
+    total = torch.numel(targets)
+    return (correct / total).item()
 
-def dice_coefficient(pred, target, smooth=1):
-    pred = pred.flatten()
-    target = target.flatten()
-    intersection = (pred * target).sum()
-    return (2. * intersection + smooth) / (pred.sum() + target.sum() + smooth)
+def compute_precision(preds, targets, threshold=0.5, smooth=1):
+    preds_bin = (preds > threshold).float()
+    preds_bin = preds_bin.view(-1)
+    targets = targets.view(-1)
+    true_positive = (preds_bin * targets).sum()
+    predicted_positive = preds_bin.sum()
+    precision = (true_positive + smooth) / (predicted_positive + smooth)
+    return precision.item()
 
-# -----------------------
-# Train and Evaluate
-# -----------------------
-def run_experiment(name, loss_fn, save_dir):
-    print(f"\n Running experiment: {name}")
-    os.makedirs(save_dir, exist_ok=True)
+def compute_recall(preds, targets, threshold=0.5, smooth=1):
+    preds_bin = (preds > threshold).float()
+    preds_bin = preds_bin.view(-1)
+    targets = targets.view(-1)
+    true_positive = (preds_bin * targets).sum()
+    actual_positive = targets.sum()
+    recall = (true_positive + smooth) / (actual_positive + smooth)
+    return recall.item()
 
-    dataset = RoadDataset("data/input", "data/target")
-    dataloader = DataLoader(dataset, batch_size=8, shuffle=True)
+def compute_f1(preds, targets, threshold=0.5, smooth=1):
+    precision = compute_precision(preds, targets, threshold, smooth)
+    recall = compute_recall(preds, targets, threshold, smooth)
+    f1 = (2 * precision * recall) / (precision + recall + smooth)
+    return f1
 
-    model = UNet()
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
+def compute_dice(preds, targets, threshold=0.5, smooth=1):
+    preds_bin = (preds > threshold).float()
+    preds_bin = preds_bin.view(-1)
+    targets = targets.view(-1)
+    intersection = (preds_bin * targets).sum()
+    dice = (2. * intersection + smooth) / (preds_bin.sum() + targets.sum() + smooth)
+    return dice.item()
+
+def compute_mse_distance(preds, targets, threshold=0.5):
+    """
+    Compute Mean Squared Error based on distance transform from ground truth.
+    preds: model outputs (batch_size, 1, H, W)
+    targets: ground-truth masks (batch_size, 1, H, W)
+    """
+    batch_mse = []
+
+    for pred, target in zip(preds, targets):
+        # Threshold prediction
+        pred_bin = (pred > threshold).float()
+
+        # Ground-truth to numpy and distance transform
+        target_np = target.squeeze().cpu().numpy().astype(np.uint8)
+        distance_transform = cv2.distanceTransform(1 - target_np, distanceType=cv2.DIST_L2, maskSize=5)
+
+        # Prediction to numpy
+        pred_bin_np = pred_bin.squeeze().cpu().numpy()
+
+        # MSE computation
+        mse = np.mean((pred_bin_np * distance_transform) ** 2)
+        batch_mse.append(mse)
+
+    return np.mean(batch_mse)  # Mean over batch
+
+
+# ---------------------
+# Node Precision and Recall (Valence-based)
+# ---------------------
+
+def compute_valence_map(skeleton):
+    kernel = np.array([[1,1,1],
+                       [1,0,1],
+                       [1,1,1]], dtype=np.uint8)
+    neighbor_count = cv2.filter2D(skeleton, -1, kernel)
+    valence_map = skeleton * neighbor_count
+    return valence_map
+
+def extract_nodes(valence_map, valence):
+    coords = np.argwhere(valence_map == valence)
+    return coords
+
+def bipartite_match(pred_nodes, gt_nodes, max_dist=3):
+    if len(pred_nodes) == 0 or len(gt_nodes) == 0:
+        return 0, 0
+    tree = cKDTree(gt_nodes)
+    dists, indices = tree.query(pred_nodes, distance_upper_bound=max_dist)
+    matched_pred = np.sum(dists <= max_dist)
+    matched_gt = len(set(indices[dists <= max_dist]))
+    return matched_pred, matched_gt
+
+def evaluate_node_precision_recall(pred_skeleton, gt_skeleton, threshold=0.5):
+    pred_bin = (pred_skeleton > threshold).float().squeeze().cpu().numpy().astype(np.uint8)
+    gt_bin = gt_skeleton.squeeze().cpu().numpy().astype(np.uint8)
+
+    pred_bin = skeletonize(pred_bin).astype(np.uint8)
+    gt_bin = skeletonize(gt_bin).astype(np.uint8)
+
+    pred_valence = compute_valence_map(pred_bin)
+    gt_valence = compute_valence_map(gt_bin)
+
+    valences = [1, 2, 3, 4]
+    results = {}
+
+    for v in valences:
+        pred_nodes = extract_nodes(pred_valence, v)
+        gt_nodes = extract_nodes(gt_valence, v)
+        matched_pred, matched_gt = bipartite_match(pred_nodes, gt_nodes, max_dist=3)
+
+        precision = matched_pred / max(len(pred_nodes), 1)
+        recall = matched_gt / max(len(gt_nodes), 1)
+
+        results[v] = {
+            "precision": precision,
+            "recall": recall,
+            "matched_pred": matched_pred,
+            "total_pred": len(pred_nodes),
+            "matched_gt": matched_gt,
+            "total_gt": len(gt_nodes)
+        }
+
+    return results
+
+def compute_iou(preds, targets, threshold=0.5, smooth=1):
+    preds_bin = (preds > threshold).float()
+    preds_bin = preds_bin.view(-1)
+    targets = targets.view(-1)
+    intersection = (preds_bin * targets).sum()
+    union = preds_bin.sum() + targets.sum() - intersection
+    iou = (intersection + smooth) / (union + smooth)
+    return iou.item()
+
+
+# ---------------------
+# Training Loop
+# ---------------------
+def train(learning_rate=1e-3, use_dice_loss=True, num_epochs=3):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    input_dir = "data/distorted_input"
+    target_dir = "data/target"
+    dataset = RoadDataset(input_dir, target_dir)
+
+    train_size = int(0.9 * len(dataset))
+    val_size = len(dataset) - train_size
+    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+
+    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False)
+
+    model = UNet().to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+
+    bce = nn.BCELoss()
+    dice = DiceLoss()
+    if use_dice_loss:
+        loss_fn = lambda pred, target: 0.5 * bce(pred, target) + 0.5 * dice(pred, target)
+    else:
+        loss_fn = bce  # Only BCE
+
+    os.makedirs("results", exist_ok=True)
     loss_history = []
 
-    for epoch in range(5):  # short training for ablation
+    for epoch in range(num_epochs):
         model.train()
         total_loss = 0
-        for x, y in dataloader:
+        for x, y in train_loader:
+            x, y = x.to(device), y.to(device)
             pred = model(x)
             loss = loss_fn(pred, y)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
-        avg_loss = total_loss / len(dataloader)
+
+        avg_loss = total_loss / len(train_loader)
         loss_history.append(avg_loss)
         print(f"Epoch {epoch+1}, Loss: {avg_loss:.4f}")
 
-    # Save loss curve
-    plt.plot(loss_history)
-    plt.title(f"{name} Loss Curve")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.savefig(os.path.join(save_dir, "loss_curve.png"))
-    plt.close()
-
-    # Evaluate
+    # Final Evaluation on Validation Set
     model.eval()
-    all_mse = []
-    all_dice = []
+    total_val_loss = 0
+    total_dice = 0
+    total_iou = 0
+
     with torch.no_grad():
-        for i, (x, y) in enumerate(dataset):
-            pred = model(x.unsqueeze(0)).squeeze().numpy()
-            pred_bin = (pred > 0.5).astype(np.float32)
-            all_mse.append(mse(pred_bin, y.squeeze().numpy()))
-            all_dice.append(dice_coefficient(pred_bin, y.squeeze().numpy()))
+        for x, y in val_loader:
+            x, y = x.to(device), y.to(device)
+            pred = model(x)
 
-            if i < 3:
-                fig, axs = plt.subplots(1, 3, figsize=(10, 3))
-                axs[0].imshow(x.squeeze(), cmap='gray')
-                axs[0].set_title("Input")
-                axs[1].imshow(y.squeeze(), cmap='gray')
-                axs[1].set_title("Ground Truth")
-                axs[2].imshow(pred, cmap='gray')
-                axs[2].set_title("Prediction (Soft)")
-                for ax in axs: ax.axis('off')
-                plt.savefig(os.path.join(save_dir, f"sample_{i}.png"))
-                plt.close()
+            loss = loss_fn(pred, y)
+            total_val_loss += loss.item()
+            total_dice += compute_dice(pred, y, threshold=0.3)
+            total_iou += compute_iou(pred, y, threshold=0.3)
 
-    results = {
-        "avg_loss": loss_history[-1],
-        "avg_mse": float(np.mean(all_mse)),
-        "avg_dice": float(np.mean(all_dice))
+    final_val_loss = total_val_loss / len(val_loader)
+    final_val_dice = total_dice / len(val_loader)
+    final_val_iou = total_iou / len(val_loader)
+
+    print(f"\nSummary for learning_rate={learning_rate}, use_dice_loss={use_dice_loss}")
+    print(f"Final Validation Loss (Test Loss): {final_val_loss:.4f}")
+    print(f"Final Validation Dice Score: {final_val_dice:.4f}")
+    print(f"Final Validation IoU: {final_val_iou:.4f}")
+
+    return {
+        "learning_rate": learning_rate,
+        "use_dice_loss": use_dice_loss,
+        "val_loss": final_val_loss,
+        "val_dice": final_val_dice,
+        "val_iou": final_val_iou
     }
-    print(f"\n{name} - MSE: {results['avg_mse']:.5f}, Dice: {results['avg_dice']:.5f}")
-    with open(os.path.join(save_dir, "metrics.json"), "w") as f:
-        json.dump(results, f, indent=2)
 
-# -----------------------
-# Run all configs
-# -----------------------
+
 if __name__ == "__main__":
-    bce = nn.BCELoss()
-    dice = DiceLoss()
+    results = []
 
-    run_experiment("BCE Only", bce, "ablation_results/run_bce")
-    run_experiment("Dice Only", dice, "ablation_results/run_dice")
-    run_experiment("BCE + Dice", lambda p, t: 0.5 * bce(p, t) + 0.5 * dice(p, t), "ablation_results/run_bce_dice")
+    # Baseline
+    results.append(train(learning_rate=1e-3, use_dice_loss=True, num_epochs=3))
+
+    # Experiment 1: Lower Learning Rate
+    results.append(train(learning_rate=1e-4, use_dice_loss=True, num_epochs=3))
+
+    # Experiment 2: Only BCE Loss
+    results.append(train(learning_rate=1e-3, use_dice_loss=False, num_epochs=3))
+
+    # (Optional) Experiment 3: Lower LR + Only BCE
+    results.append(train(learning_rate=1e-4, use_dice_loss=False, num_epochs=3))
+
+    # Print all results at end
+    print("\n===== Ablation Study Results =====")
+    for r in results:
+        print(r)

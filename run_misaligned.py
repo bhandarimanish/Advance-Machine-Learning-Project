@@ -1,20 +1,20 @@
 import os
+import random
 import torch
 import torch.nn as nn
-import numpy as np
+from torch.utils.data import Dataset, DataLoader, random_split
 import cv2
+import numpy as np
 import matplotlib.pyplot as plt
-from torch.utils.data import Dataset, DataLoader
-from glob import glob
-from tqdm import tqdm
+from skimage.morphology import skeletonize
 
-# -----------------------
-# Dataset with GT shifting
-# -----------------------
+# ---------------------
+# Dataset Loader (with GT shifting)
+# ---------------------
 class RoadDataset(Dataset):
     def __init__(self, input_dir, target_dir, shift_targets=False):
-        self.input_paths = sorted(glob(os.path.join(input_dir, "*.png")))
-        self.target_paths = sorted(glob(os.path.join(target_dir, "*.png")))
+        self.input_paths = sorted([os.path.join(input_dir, f) for f in os.listdir(input_dir)])
+        self.target_paths = sorted([os.path.join(target_dir, f) for f in os.listdir(target_dir)])
         self.shift_targets = shift_targets
 
     def __len__(self):
@@ -25,39 +25,70 @@ class RoadDataset(Dataset):
         y = cv2.imread(self.target_paths[idx], cv2.IMREAD_GRAYSCALE) / 255.0
 
         if self.shift_targets:
-            shift_x = np.random.randint(-2, 3)
-            shift_y = np.random.randint(-2, 3)
+            shift_x = random.randint(-2, 2)
+            shift_y = random.randint(-2, 2)
             y = np.roll(y, shift=(shift_y, shift_x), axis=(0, 1))
 
         x = torch.tensor(x, dtype=torch.float32).unsqueeze(0)
         y = torch.tensor(y, dtype=torch.float32).unsqueeze(0)
         return x, y
 
-# -----------------------
+# ---------------------
 # U-Net
-# -----------------------
+# ---------------------
 class UNet(nn.Module):
     def __init__(self):
         super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Conv2d(1, 8, 3, padding=1), nn.ReLU(),
-            nn.Conv2d(8, 8, 3, padding=1), nn.ReLU(),
-            nn.MaxPool2d(2)
-        )
-        self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(8, 8, 2, stride=2), nn.ReLU(),
-            nn.Conv2d(8, 1, 1)
-        )
+        def block(in_channels, out_channels):
+            return nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, 3, padding=1), nn.ReLU(),
+                nn.Conv2d(out_channels, out_channels, 3, padding=1), nn.ReLU()
+            )
+
+        self.enc1 = block(1, 16)
+        self.pool1 = nn.MaxPool2d(2)
+        self.enc2 = block(16, 32)
+        self.pool2 = nn.MaxPool2d(2)
+        self.enc3 = block(32, 64)
+        self.pool3 = nn.MaxPool2d(2)
+
+        self.bottleneck = block(64, 128)
+
+        self.upconv3 = nn.ConvTranspose2d(128, 64, 2, stride=2)
+        self.dec3 = block(128, 64)
+        self.upconv2 = nn.ConvTranspose2d(64, 32, 2, stride=2)
+        self.dec2 = block(64, 32)
+        self.upconv1 = nn.ConvTranspose2d(32, 16, 2, stride=2)
+        self.dec1 = block(32, 16)
+
+        self.final_conv = nn.Conv2d(16, 1, 1)
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        x = self.encoder(x)
-        x = self.decoder(x)
-        return self.sigmoid(x)
+        enc1 = self.enc1(x)
+        enc2 = self.enc2(self.pool1(enc1))
+        enc3 = self.enc3(self.pool2(enc2))
 
-# -----------------------
-# Dice Loss
-# -----------------------
+        bottleneck = self.bottleneck(self.pool3(enc3))
+
+        dec3 = self.upconv3(bottleneck)
+        dec3 = torch.cat((dec3, enc3), dim=1)
+        dec3 = self.dec3(dec3)
+
+        dec2 = self.upconv2(dec3)
+        dec2 = torch.cat((dec2, enc2), dim=1)
+        dec2 = self.dec2(dec2)
+
+        dec1 = self.upconv1(dec2)
+        dec1 = torch.cat((dec1, enc1), dim=1)
+        dec1 = self.dec1(dec1)
+
+        out = self.final_conv(dec1)
+        return self.sigmoid(out)
+
+# ---------------------
+# Loss Functions
+# ---------------------
 class DiceLoss(nn.Module):
     def forward(self, inputs, targets, smooth=1):
         inputs = inputs.view(-1)
@@ -65,62 +96,175 @@ class DiceLoss(nn.Module):
         intersection = (inputs * targets).sum()
         return 1 - ((2. * intersection + smooth) / (inputs.sum() + targets.sum() + smooth))
 
-# -----------------------
-# Train with Misaligned GT
-# -----------------------
-def train_misaligned():
-    dataset = RoadDataset("data/input", "data/target", shift_targets=True)
-    dataloader = DataLoader(dataset, batch_size=8, shuffle=True)
+class SoftAlignedDiceLoss(nn.Module):
+    def __init__(self, max_shift=2):
+        super().__init__()
+        self.max_shift = max_shift
+        self.base_dice = DiceLoss()
 
-    model = UNet()
+    def forward(self, inputs, targets):
+        best_loss = float('inf')
+        for shift_x in range(-self.max_shift, self.max_shift + 1):
+            for shift_y in range(-self.max_shift, self.max_shift + 1):
+                shifted_target = torch.roll(targets, shifts=(shift_y, shift_x), dims=(2, 3))
+                loss = self.base_dice(inputs, shifted_target)
+                if loss < best_loss:
+                    best_loss = loss
+        return best_loss
+
+def compute_accuracy(preds, targets, threshold=0.5):
+    preds_bin = (preds > threshold).float()
+    correct = (preds_bin == targets).float().sum()
+    total = torch.numel(targets)
+    return (correct / total).item()
+
+def compute_precision(preds, targets, threshold=0.5, smooth=1):
+    preds_bin = (preds > threshold).float()
+    preds_bin = preds_bin.view(-1)
+    targets = targets.view(-1)
+    true_positive = (preds_bin * targets).sum()
+    predicted_positive = preds_bin.sum()
+    precision = (true_positive + smooth) / (predicted_positive + smooth)
+    return precision.item()
+
+def compute_recall(preds, targets, threshold=0.5, smooth=1):
+    preds_bin = (preds > threshold).float()
+    preds_bin = preds_bin.view(-1)
+    targets = targets.view(-1)
+    true_positive = (preds_bin * targets).sum()
+    actual_positive = targets.sum()
+    recall = (true_positive + smooth) / (actual_positive + smooth)
+    return recall.item()
+
+def compute_f1(preds, targets, threshold=0.5, smooth=1):
+    precision = compute_precision(preds, targets, threshold, smooth)
+    recall = compute_recall(preds, targets, threshold, smooth)
+    f1 = (2 * precision * recall) / (precision + recall + smooth)
+    return f1
+
+def compute_dice(preds, targets, threshold=0.5, smooth=1):
+    preds_bin = (preds > threshold).float()
+    preds_bin = preds_bin.view(-1)
+    targets = targets.view(-1)
+    intersection = (preds_bin * targets).sum()
+    dice = (2. * intersection + smooth) / (preds_bin.sum() + targets.sum() + smooth)
+    return dice.item()
+
+# ---------------------
+# Training Loop
+# ---------------------
+def train():
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    input_dir = "data/distorted_input"
+    target_dir = "data/target"
+    dataset = RoadDataset(input_dir, target_dir, shift_targets=True)  # << IMPORTANT: shift_targets=True
+
+    train_size = int(0.9 * len(dataset))
+    val_size = len(dataset) - train_size
+    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+
+    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False)
+
+    model = UNet().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
     bce = nn.BCELoss()
-    dice = DiceLoss()
-    loss_fn = lambda p, t: 0.5 * bce(p, t) + 0.5 * dice(p, t)
+    dice = SoftAlignedDiceLoss(max_shift=2)  # << Using soft alignment loss
+    loss_fn = lambda pred, target: 0.5 * bce(pred, target) + 0.5 * dice(pred, target)
 
-    os.makedirs("results/misaligned_run", exist_ok=True)
+    os.makedirs("results_misaligned", exist_ok=True)
     loss_history = []
 
-    for epoch in range(10):
+    for epoch in range(2):
         model.train()
         total_loss = 0
-        for x, y in dataloader:
+        for x, y in train_loader:
+            x, y = x.to(device), y.to(device)
             pred = model(x)
             loss = loss_fn(pred, y)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
-        avg_loss = total_loss / len(dataloader)
+
+        avg_loss = total_loss / len(train_loader)
         loss_history.append(avg_loss)
         print(f"Epoch {epoch+1}, Loss: {avg_loss:.4f}")
 
-    # Save model + curve
-    torch.save(model.state_dict(), "results/misaligned_run/model.pth")
+    # Save model
+    torch.save(model.state_dict(), "results_misaligned/model.pth")
+
+    # Save loss curve
     plt.plot(loss_history)
-    plt.title("Misaligned GT Training Loss")
+    plt.title("Training Loss Curve")
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
-    plt.savefig("results/misaligned_run/loss_curve.png")
+    plt.tight_layout()
+    plt.savefig("results_misaligned/loss_curve.png")
     plt.close()
 
-    # Save 3 predictions
+    # Final Evaluation on Validation Set
     model.eval()
+    total_acc = 0
+    total_dice = 0
+    total_precision = 0
+    total_recall = 0
+    total_f1 = 0
+
     with torch.no_grad():
-        for i in range(3):
-            x, y = dataset[i]
-            pred = model(x.unsqueeze(0)).squeeze().numpy()
-            fig, axs = plt.subplots(1, 3, figsize=(10, 3))
-            axs[0].imshow(x.squeeze(), cmap='gray')
-            axs[0].set_title("Input")
-            axs[1].imshow(y.squeeze(), cmap='gray')
-            axs[1].set_title("Shifted GT")
-            axs[2].imshow(pred, cmap='gray')
-            axs[2].set_title("Prediction")
-            for ax in axs: ax.axis('off')
-            plt.savefig(f"results/misaligned_run/sample_{i}.png")
-            plt.close()
+        for x, y in val_loader:
+            x, y = x.to(device), y.to(device)
+            pred = model(x)
+            total_acc += compute_accuracy(pred, y, threshold=0.3)
+            total_dice += compute_dice(pred, y, threshold=0.3)
+            total_precision += compute_precision(pred, y, threshold=0.3)
+            total_recall += compute_recall(pred, y, threshold=0.3)
+            total_f1 += compute_f1(pred, y, threshold=0.3)
+
+    final_acc = total_acc / len(val_loader)
+    final_dice = total_dice / len(val_loader)
+    final_precision = total_precision / len(val_loader)
+    final_recall = total_recall / len(val_loader)
+    final_f1 = total_f1 / len(val_loader)
+
+    print(f"Final Validation Accuracy: {final_acc:.4f}")
+    print(f"Final Validation Dice Score: {final_dice:.4f}")
+    print(f"Final Validation Precision: {final_precision:.4f}")
+    print(f"Final Validation Recall: {final_recall:.4f}")
+    print(f"Final Validation F1 Score: {final_f1:.4f}")
+
+    # Save predictions for a few samples
+    for i in range(3):
+        x, y_shifted = val_dataset[i]
+        x = x.unsqueeze(0).to(device)
+        pred = model(x).squeeze().cpu().detach().numpy()
+
+        pred_bin = (pred > 0.3).astype(np.uint8)
+        pred_skel = skeletonize(pred_bin).astype(np.uint8) * 255
+
+        # Load original unshifted ground truth
+        original_y_path = dataset.target_paths[val_dataset.indices[i]]  # CAREFUL: use .indices
+        original_gt = cv2.imread(original_y_path, cv2.IMREAD_GRAYSCALE) / 255.0
+
+        fig, axs = plt.subplots(1, 4, figsize=(20, 5))
+        axs[0].imshow(x.squeeze().cpu(), cmap='gray')
+        axs[0].set_title("Input")
+        axs[1].imshow(original_gt, cmap='gray')
+        axs[1].set_title("Original Ground Truth")
+        axs[2].imshow(y_shifted.squeeze().cpu(), cmap='gray')
+        axs[2].set_title("Shifted Ground Truth (used in training)")
+        axs[3].imshow(pred_skel, cmap='gray')
+        axs[3].set_title("Prediction (Skeleton)")
+        for ax in axs:
+            ax.axis('off')
+        plt.tight_layout()
+        plt.savefig(f"results_misaligned/preview_{i:05d}.png", bbox_inches='tight')
+        plt.close()
+
+        # Save just the skeletonized prediction
+        cv2.imwrite(f"results_misaligned/sample_{i:05d}.png", pred_skel)
+
 
 if __name__ == "__main__":
-    train_misaligned()
+    train()

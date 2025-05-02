@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 # === Paths ===
 input_folder = 'data/input'
 distorted_folder = 'data/distorted_input'
-ground_truth_folder = 'data/output'
+ground_truth_folder = 'data/target'
 save_folder = 'data/comparison_plots'
 
 # Create output folders if not exists
@@ -69,6 +69,8 @@ print("Creating comparison plots...")
 
 # Pick 3 random images
 all_files = [f for f in os.listdir(input_folder) if f.endswith('.png')]
+random.seed(50)
+print(random.sample(range(10), 3)) 
 chosen_files = random.sample(all_files, 3)
 
 for idx, file_name in enumerate(chosen_files):

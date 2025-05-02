@@ -8,14 +8,18 @@ import numpy as np
 import matplotlib.pyplot as plt
 from skimage.morphology import skeletonize
 from scipy.spatial import cKDTree
+import numpy as np
 
 # ---------------------
 # Dataset Loader
 # ---------------------
 class RoadDataset(Dataset):
     def __init__(self, input_dir, target_dir):
-        self.input_paths = sorted([os.path.join(input_dir, f) for f in os.listdir(input_dir)])
-        self.target_paths = sorted([os.path.join(target_dir, f) for f in os.listdir(target_dir)])
+        # self.input_paths = sorted([os.path.join(input_dir, f) for f in os.listdir(input_dir)])
+        # self.target_paths = sorted([os.path.join(target_dir, f) for f in os.listdir(target_dir)])
+        self.input_paths = sorted([os.path.join(input_dir, f) for f in os.listdir(input_dir) if f.endswith(".png")])
+        self.target_paths = sorted([os.path.join(target_dir, f) for f in os.listdir(target_dir) if f.endswith(".png")])
+
 
     def __len__(self):
         return len(self.input_paths)
@@ -227,6 +231,10 @@ def compute_iou(preds, targets, threshold=0.5, smooth=1):
 # Training Loop
 # ---------------------
 def train():
+    torch.manual_seed(50)
+    random.seed(50)
+    np.random.seed(50)
+    print(random.sample(range(10), 3))
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     input_dir = "data/distorted_input"
     target_dir = "data/target"
@@ -249,7 +257,7 @@ def train():
     os.makedirs("results", exist_ok=True)
     loss_history = []
 
-    for epoch in range(3):
+    for epoch in range(20):
         model.train()
         total_loss = 0
         for x, y in train_loader:
@@ -375,6 +383,66 @@ def train():
 
         # Save only skeleton prediction
         cv2.imwrite(f"results/sample_{i:05d}.png", pred_skel)
+       
+        metrics = {
+            "Accuracy": final_acc,
+            "Precision": final_precision,
+            "Recall": final_recall,
+            "F1 Score": final_f1,
+            "Dice": final_dice,
+            "IoU": final_iou,
+            "MSE": final_val_mse 
+        }
+
+        # Standard Metrics Bar Chart with Labels
+        plt.figure(figsize=(10, 6))
+        bars = plt.bar(metrics.keys(), metrics.values())
+        plt.ylabel("Score")
+        plt.title("Standard Evaluation Metrics")
+        plt.ylim(0, 1.05)
+        plt.xticks(rotation=45)
+
+        # Add value labels on top
+        for bar in bars:
+            height = bar.get_height()
+            plt.text(bar.get_x() + bar.get_width() / 2.0, height + 0.01,
+                    f"{height:.2f}", ha='center', va='bottom', fontsize=9)
+
+        plt.tight_layout()
+        plt.savefig("results/standard_metrics_bar.png")
+        plt.close()
+
+
+
+        # ---------------------
+        # Save Valent Node Metrics Plot (Grouped Bar Chart)
+        # ---------------------
+        # Node-Level Precision and Recall with Labels
+        valences = [1, 2, 3, 4]
+        precisions = [final_node_results[v]['precision'] for v in valences]
+        recalls = [final_node_results[v]['recall'] for v in valences]
+
+        x = np.arange(len(valences))
+        width = 0.35
+
+        plt.figure(figsize=(8, 6))
+        bars1 = plt.bar(x - width/2, precisions, width, label='Precision')
+        bars2 = plt.bar(x + width/2, recalls, width, label='Recall')
+
+        # Add value labels
+        for bar in bars1 + bars2:
+            height = bar.get_height()
+            plt.text(bar.get_x() + bar.get_width() / 2.0, height + 0.01,
+                    f"{height:.2f}", ha='center', va='bottom', fontsize=9)
+
+        plt.xticks(x, [f'{v}-valent' for v in valences])
+        plt.ylim(0, 1.05)
+        plt.ylabel("Score")
+        plt.title("Node-Level Precision and Recall")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig("results/node_metrics_bar.png")
+        plt.close()
 
 if __name__ == "__main__":
     train()

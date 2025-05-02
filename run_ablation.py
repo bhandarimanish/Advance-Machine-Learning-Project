@@ -8,6 +8,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 from skimage.morphology import skeletonize
 from scipy.spatial import cKDTree
+import matplotlib.pyplot as plt
+
 
 # ---------------------
 # Dataset Loader
@@ -80,6 +82,49 @@ class UNet(nn.Module):
 
         out = self.final_conv(dec1)
         return self.sigmoid(out)
+
+# ---------------------
+# Shallow U-Net
+# ---------------------
+class ShallowUNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        def block(in_channels, out_channels):
+            return nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, 3, padding=1), nn.ReLU(),
+                nn.Conv2d(out_channels, out_channels, 3, padding=1), nn.ReLU()
+            )
+
+        self.enc1 = block(1, 16)
+        self.pool1 = nn.MaxPool2d(2)
+        self.enc2 = block(16, 32)
+        self.pool2 = nn.MaxPool2d(2)
+
+        self.bottleneck = block(32, 64)
+
+        self.upconv2 = nn.ConvTranspose2d(64, 32, 2, stride=2)
+        self.dec2 = block(64, 32)
+        self.upconv1 = nn.ConvTranspose2d(32, 16, 2, stride=2)
+        self.dec1 = block(32, 16)
+
+        self.final_conv = nn.Conv2d(16, 1, 1)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        enc1 = self.enc1(x)
+        enc2 = self.enc2(self.pool1(enc1))
+
+        bottleneck = self.bottleneck(self.pool2(enc2))
+
+        dec2 = self.upconv2(bottleneck)
+        dec2 = torch.cat((dec2, enc2), dim=1)
+        dec2 = self.dec2(dec2)
+
+        dec1 = self.upconv1(dec2)
+        dec1 = torch.cat((dec1, enc1), dim=1)
+        dec1 = self.dec1(dec1)
+
+        return self.sigmoid(self.final_conv(dec1))
 
 # ---------------------
 # Loss Functions
@@ -226,7 +271,8 @@ def compute_iou(preds, targets, threshold=0.5, smooth=1):
 # ---------------------
 # Training Loop
 # ---------------------
-def train(learning_rate=1e-3, use_dice_loss=True, num_epochs=3):
+def train(model_class,learning_rate=1e-3, use_dice_loss=True, num_epochs=3):
+    
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     input_dir = "data/distorted_input"
     target_dir = "data/target"
@@ -239,7 +285,8 @@ def train(learning_rate=1e-3, use_dice_loss=True, num_epochs=3):
     train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False)
 
-    model = UNet().to(device)
+    # model = UNet().to(device)
+    model = model_class().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
     bce = nn.BCELoss()
@@ -288,12 +335,13 @@ def train(learning_rate=1e-3, use_dice_loss=True, num_epochs=3):
     final_val_dice = total_dice / len(val_loader)
     final_val_iou = total_iou / len(val_loader)
 
-    print(f"\nSummary for learning_rate={learning_rate}, use_dice_loss={use_dice_loss}")
+    print(f"\nSummary for model={model_class.__name__}, learning_rate={learning_rate}, use_dice_loss={use_dice_loss}")
     print(f"Final Validation Loss (Test Loss): {final_val_loss:.4f}")
     print(f"Final Validation Dice Score: {final_val_dice:.4f}")
     print(f"Final Validation IoU: {final_val_iou:.4f}")
 
     return {
+         "model": model_class.__name__,
         "learning_rate": learning_rate,
         "use_dice_loss": use_dice_loss,
         "val_loss": final_val_loss,
@@ -305,19 +353,94 @@ def train(learning_rate=1e-3, use_dice_loss=True, num_epochs=3):
 if __name__ == "__main__":
     results = []
 
-    # Baseline
-    results.append(train(learning_rate=1e-3, use_dice_loss=True, num_epochs=3))
+    # UNet experiments
+    results.append(train(model_class=UNet, learning_rate=1e-3, use_dice_loss=True, num_epochs=5))
+    results.append(train(model_class=UNet, learning_rate=1e-4, use_dice_loss=True, num_epochs=5))
+    results.append(train(model_class=UNet, learning_rate=1e-3, use_dice_loss=False, num_epochs=5))
 
-    # Experiment 1: Lower Learning Rate
-    results.append(train(learning_rate=1e-4, use_dice_loss=True, num_epochs=3))
+    # ShallowUNet experiments
+    results.append(train(model_class=ShallowUNet, learning_rate=1e-3, use_dice_loss=True, num_epochs=5))
+    results.append(train(model_class=ShallowUNet, learning_rate=1e-4, use_dice_loss=True, num_epochs=5))
+    results.append(train(model_class=ShallowUNet, learning_rate=1e-3, use_dice_loss=False, num_epochs=5))
 
-    # Experiment 2: Only BCE Loss
-    results.append(train(learning_rate=1e-3, use_dice_loss=False, num_epochs=3))
-
-    # (Optional) Experiment 3: Lower LR + Only BCE
-    results.append(train(learning_rate=1e-4, use_dice_loss=False, num_epochs=3))
-
-    # Print all results at end
+    # Print results
     print("\n===== Ablation Study Results =====")
     for r in results:
         print(r)
+
+    # ----------------------------
+    # Visualization
+    # ----------------------------
+    # --- Prepare labels and metric arrays ---
+    labels = [f"{r['model']}, LR={r['learning_rate']}, Dice={r['use_dice_loss']}" for r in results]
+    x = np.arange(len(results))
+
+    val_losses = [r["val_loss"] for r in results]
+    val_dices  = [r["val_dice"] for r in results]
+    val_ious   = [r["val_iou"] for r in results]
+
+    # --- 1) Validation Loss (lower is better) ---
+    best_loss_idx = int(np.argmin(val_losses))
+    loss_colors   = ['salmon'] * len(results)
+    loss_colors[best_loss_idx] = 'crimson'
+
+    plt.figure(figsize=(8, 5))
+    plt.bar(x, val_losses, color=loss_colors)
+    plt.title("Validation Loss")
+    plt.ylabel("Loss")
+    plt.xticks(x, labels, rotation=45, ha='right')
+    for i, v in enumerate(val_losses):
+        plt.text(i, v + 0.01, f"{v:.3f}", ha='center', fontsize=9)
+    plt.annotate(
+        'Best (lowest loss)',
+        xy=(best_loss_idx, val_losses[best_loss_idx]),
+        xytext=(best_loss_idx, val_losses[best_loss_idx] + 0.1),
+        arrowprops=dict(arrowstyle='->', color='black')
+    )
+    plt.tight_layout()
+    plt.savefig("results/loss_plot.png")
+    plt.close()
+
+    # --- 2) Dice Score (higher is better) ---
+    best_dice_idx = int(np.argmax(val_dices))
+    dice_colors   = ['lightgreen'] * len(results)
+    dice_colors[best_dice_idx] = 'darkgreen'
+
+    plt.figure(figsize=(8, 5))
+    plt.bar(x, val_dices, color=dice_colors)
+    plt.title("Dice Score")
+    plt.ylabel("Dice")
+    plt.xticks(x, labels, rotation=45, ha='right')
+    for i, v in enumerate(val_dices):
+        plt.text(i, v + 0.01, f"{v:.3f}", ha='center', fontsize=9)
+    plt.annotate(
+        'Best (highest Dice)',
+        xy=(best_dice_idx, val_dices[best_dice_idx]),
+        xytext=(best_dice_idx, val_dices[best_dice_idx] + 0.05),
+        arrowprops=dict(arrowstyle='->', color='black')
+    )
+    plt.tight_layout()
+    plt.savefig("results/dice_plot.png")
+    plt.close()
+
+    # --- 3) IoU (higher is better) ---
+    best_iou_idx = int(np.argmax(val_ious))
+    iou_colors   = ['lightblue'] * len(results)
+    iou_colors[best_iou_idx] = 'navy'
+
+    plt.figure(figsize=(8, 5))
+    plt.bar(x, val_ious, color=iou_colors)
+    plt.title("IoU")
+    plt.ylabel("IoU")
+    plt.xticks(x, labels, rotation=45, ha='right')
+    for i, v in enumerate(val_ious):
+        plt.text(i, v + 0.01, f"{v:.3f}", ha='center', fontsize=9)
+    plt.annotate(
+        'Best (highest IoU)',
+        xy=(best_iou_idx, val_ious[best_iou_idx]),
+        xytext=(best_iou_idx, val_ious[best_iou_idx] + 0.05),
+        arrowprops=dict(arrowstyle='->', color='black')
+    )
+    plt.tight_layout()
+    plt.savefig("results/iou_plot.png")
+    plt.close()

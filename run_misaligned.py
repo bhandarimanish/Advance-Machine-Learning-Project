@@ -150,6 +150,41 @@ def compute_dice(preds, targets, threshold=0.5, smooth=1):
     dice = (2. * intersection + smooth) / (preds_bin.sum() + targets.sum() + smooth)
     return dice.item()
 
+def compute_iou(preds, targets, threshold=0.5, smooth=1):
+    preds_bin = (preds > threshold).float()
+    preds_bin = preds_bin.view(-1)
+    targets = targets.view(-1)
+    intersection = (preds_bin * targets).sum()
+    union = preds_bin.sum() + targets.sum() - intersection
+    iou = (intersection + smooth) / (union + smooth)
+    return iou.item()
+
+def compute_mse_distance(preds, targets, threshold=0.5):
+    """
+    Compute Mean Squared Error based on distance transform from ground truth.
+    preds: model outputs (batch_size, 1, H, W)
+    targets: ground-truth masks (batch_size, 1, H, W)
+    """
+    batch_mse = []
+
+    for pred, target in zip(preds, targets):
+        # Threshold prediction
+        pred_bin = (pred > threshold).float()
+
+        # Convert GT to numpy and compute distance transform
+        target_np = target.squeeze().cpu().numpy().astype(np.uint8)
+        distance_transform = cv2.distanceTransform(1 - target_np, distanceType=cv2.DIST_L2, maskSize=5)
+
+        # Prediction to numpy
+        pred_bin_np = pred_bin.squeeze().cpu().numpy()
+
+        # MSE computation only on predicted positives
+        mse = np.mean((pred_bin_np * distance_transform) ** 2)
+        batch_mse.append(mse)
+
+    return np.mean(batch_mse)
+
+
 # ---------------------
 # Training Loop
 # ---------------------
@@ -157,11 +192,31 @@ def train():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     input_dir = "data/distorted_input"
     target_dir = "data/target"
-    dataset = RoadDataset(input_dir, target_dir, shift_targets=True)  # << IMPORTANT: shift_targets=True
 
-    train_size = int(0.9 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+    # Load full dataset without shifting
+    full_dataset = RoadDataset(input_dir, target_dir, shift_targets=False)
+
+    # Split dataset
+    train_size = int(0.9 * len(full_dataset))
+    val_size = len(full_dataset) - train_size
+    train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
+
+    # Wrap training dataset to apply random GT shifting
+    class ShiftedDataset(torch.utils.data.Dataset):
+        def __init__(self, subset):
+            self.subset = subset
+
+        def __len__(self):
+            return len(self.subset)
+
+        def __getitem__(self, idx):
+            x, y = self.subset[idx]
+            shift_x = random.randint(-2, 2)
+            shift_y = random.randint(-2, 2)
+            y = torch.roll(y, shifts=(shift_y, shift_x), dims=(1, 2))
+            return x, y
+
+    train_dataset = ShiftedDataset(train_dataset)
 
     train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False)
@@ -170,13 +225,13 @@ def train():
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
     bce = nn.BCELoss()
-    dice = SoftAlignedDiceLoss(max_shift=2)  # << Using soft alignment loss
+    dice = SoftAlignedDiceLoss(max_shift=2)
     loss_fn = lambda pred, target: 0.5 * bce(pred, target) + 0.5 * dice(pred, target)
 
     os.makedirs("results_misaligned", exist_ok=True)
     loss_history = []
 
-    for epoch in range(2):
+    for epoch in range(20):
         model.train()
         total_loss = 0
         for x, y in train_loader:
@@ -204,13 +259,15 @@ def train():
     plt.savefig("results_misaligned/loss_curve.png")
     plt.close()
 
-    # Final Evaluation on Validation Set
+    # Evaluation
     model.eval()
     total_acc = 0
     total_dice = 0
     total_precision = 0
     total_recall = 0
     total_f1 = 0
+    total_iou = 0
+    total_val_mse = 0
 
     with torch.no_grad():
         for x, y in val_loader:
@@ -221,49 +278,102 @@ def train():
             total_precision += compute_precision(pred, y, threshold=0.3)
             total_recall += compute_recall(pred, y, threshold=0.3)
             total_f1 += compute_f1(pred, y, threshold=0.3)
+            total_iou += compute_iou(pred, y, threshold=0.3)
+            total_val_mse += compute_mse_distance(pred, y, threshold=0.3)
 
     final_acc = total_acc / len(val_loader)
     final_dice = total_dice / len(val_loader)
     final_precision = total_precision / len(val_loader)
     final_recall = total_recall / len(val_loader)
     final_f1 = total_f1 / len(val_loader)
+    final_iou = total_iou / len(val_loader)
+    final_val_mse = total_val_mse / len(val_loader)
+
 
     print(f"Final Validation Accuracy: {final_acc:.4f}")
     print(f"Final Validation Dice Score: {final_dice:.4f}")
     print(f"Final Validation Precision: {final_precision:.4f}")
     print(f"Final Validation Recall: {final_recall:.4f}")
     print(f"Final Validation F1 Score: {final_f1:.4f}")
+    print(f"Final Validation IoU: {final_iou:.4f}")
+    print(f"Final Validation MSE (Distance Transform): {final_val_mse:.6f}")
 
-    # Save predictions for a few samples
+
+    # Save a few predictions with original GT
     for i in range(3):
-        x, y_shifted = val_dataset[i]
-        x = x.unsqueeze(0).to(device)
-        pred = model(x).squeeze().cpu().detach().numpy()
+        x, y = val_dataset[i]
+        x_input = x.unsqueeze(0).to(device)
+        pred = model(x_input).squeeze().cpu().detach().numpy()
 
         pred_bin = (pred > 0.3).astype(np.uint8)
         pred_skel = skeletonize(pred_bin).astype(np.uint8) * 255
 
-        # Load original unshifted ground truth
-        original_y_path = dataset.target_paths[val_dataset.indices[i]]  # CAREFUL: use .indices
+        # Load original GT from disk
+        original_y_path = full_dataset.target_paths[val_dataset.indices[i]]
         original_gt = cv2.imread(original_y_path, cv2.IMREAD_GRAYSCALE) / 255.0
 
-        fig, axs = plt.subplots(1, 4, figsize=(20, 5))
+        # Generate shifted GT similar to training
+        shift_x = random.randint(-2, 2)
+        shift_y = random.randint(-2, 2)
+        shifted_gt = np.roll(original_gt, shift=(shift_y, shift_x), axis=(0, 1))
+
+        # Plot all
+        fig, axs = plt.subplots(1, 4, figsize=(22, 5))
         axs[0].imshow(x.squeeze().cpu(), cmap='gray')
         axs[0].set_title("Input")
+
         axs[1].imshow(original_gt, cmap='gray')
         axs[1].set_title("Original Ground Truth")
-        axs[2].imshow(y_shifted.squeeze().cpu(), cmap='gray')
-        axs[2].set_title("Shifted Ground Truth (used in training)")
+
+        axs[2].imshow(shifted_gt, cmap='gray')
+        axs[2].set_title("Shifted Ground Truth (Train)")
+
         axs[3].imshow(pred_skel, cmap='gray')
         axs[3].set_title("Prediction (Skeleton)")
+
         for ax in axs:
             ax.axis('off')
+
         plt.tight_layout()
         plt.savefig(f"results_misaligned/preview_{i:05d}.png", bbox_inches='tight')
         plt.close()
 
-        # Save just the skeletonized prediction
         cv2.imwrite(f"results_misaligned/sample_{i:05d}.png", pred_skel)
+
+
+    # ---------------------
+    # Visualize and Save Evaluation Metrics
+    # ---------------------
+
+    metrics = {
+        "Accuracy": final_acc,
+        "Precision": final_precision,
+        "Recall": final_recall,
+        "F1 Score": final_f1,
+        "Dice": final_dice,
+        "IoU": final_iou,
+        "MSE (Dist)": final_val_mse
+    }
+
+    # Bar plot
+    plt.figure(figsize=(10, 6))
+    bars = plt.bar(metrics.keys(), metrics.values())
+    plt.ylabel("Score")
+    plt.title("Evaluation Metrics")
+    plt.ylim(0, max(1.05, max(metrics.values()) + 0.05))
+    plt.xticks(rotation=45)
+
+    # Add value labels on top of bars
+    for bar in bars:
+        height = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width() / 2.0, height + 0.01,
+                f"{height:.2f}", ha='center', va='bottom', fontsize=9)
+
+    plt.tight_layout()
+    plt.savefig("results_misaligned/metrics_bar.png")
+    plt.close()
+
+
 
 
 if __name__ == "__main__":
